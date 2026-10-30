@@ -168,7 +168,6 @@ from documents.permissions import PaperlessNotePermissions
 from documents.permissions import PaperlessObjectPermissions
 from documents.permissions import TrashPermissions
 from documents.permissions import ViewDocumentsPermissions
-from documents.permissions import annotate_document_count_by_ids
 from documents.permissions import annotate_document_count_for_related_queryset
 from documents.permissions import get_document_count_filter_for_user
 from documents.permissions import get_permission_grantees
@@ -1023,70 +1022,61 @@ class DocumentViewSet(
     )
 
     def _get_selection_data_for_queryset(self, queryset):
-        # Resolve once instead of once per model below. `queryset` can carry an
-        # arbitrarily expensive WHERE clause (user filters plus the permission
-        # filter); re-embedding it as a subquery inside 5 separate Count(...)
-        # calls forces the database to re-evaluate that whole thing 5 times, and
-        # -- for FK relations especially -- can defeat semi-join planning
-        # entirely at scale. A concrete id list is cheap to reuse.
-        # order_by() drops the default/user ordering -- irrelevant for a plain
-        # id list, but left in place it forces a sort over the full filtered
-        # set before the ids can even be collected.
-        document_ids = list(queryset.order_by().values_list("pk", flat=True))
+        # The filtered queryset (user filters plus the permission filter) is
+        # kept as SQL and handed to the database, never resolved to a Python id
+        # list: at hundreds of thousands of documents that list becomes a
+        # multi-MB IN (...) clause per statement, which is slow to plan and, on
+        # SQLite, exceeds the bound-parameter limit outright. Each relation
+        # instead gets one GROUP BY with the filter as a plain WHERE
+        # (foreign keys) or a semi-join subquery (link tables).
+        # order_by() drops the default/user ordering, which is irrelevant for
+        # counting and would otherwise force a sort.
+        documents = queryset.order_by()
+        document_ids = documents.values("pk")
 
-        correspondents = Correspondent.objects.annotate(
-            document_count=Count(
-                "documents",
-                filter=Q(documents__id__in=document_ids),
-                distinct=True,
-            ),
-        )
-        document_types = DocumentType.objects.annotate(
-            document_count=Count(
-                "documents",
-                filter=Q(documents__id__in=document_ids),
-                distinct=True,
-            ),
-        )
-        storage_paths = StoragePath.objects.annotate(
-            document_count=Count(
-                "documents",
-                filter=Q(documents__id__in=document_ids),
-                distinct=True,
-            ),
-        )
-        # Tag and CustomField reach Document through an M2M/through-model table;
-        # a plain Count(filter=...) there is a much more expensive plan than the
-        # FK relations above once the bridge table is large -- see
-        # annotate_document_count_by_ids() for why.
-        tags = annotate_document_count_by_ids(
-            Tag.objects.all(),
-            through_model=Document.tags.through,
-            related_object_field="tag_id",
-            document_ids=document_ids,
-        )
-        custom_fields = annotate_document_count_by_ids(
-            CustomField.objects.all(),
-            through_model=CustomFieldInstance,
-            related_object_field="field_id",
-            document_ids=document_ids,
-        )
+        def foreign_key_counts(field_name: str) -> dict[int, int]:
+            # distinct: filters can join (and so repeat) a document row.
+            return dict(
+                documents.filter(**{f"{field_name}__isnull": False})
+                .values_list(field_name)
+                .annotate(document_count=Count("pk", distinct=True)),
+            )
+
+        def link_table_counts(link_model, field_name: str) -> dict[int, int]:
+            return dict(
+                link_model.objects.filter(document_id__in=document_ids)
+                .values_list(field_name)
+                .annotate(document_count=Count("document_id")),
+            )
+
+        def selection(model, counts: dict[int, int]) -> list[dict[str, int]]:
+            # Every object is listed, with 0 for those with no matching document.
+            return [
+                {"id": pk, "document_count": counts.get(pk, 0)}
+                for pk in model.objects.values_list("pk", flat=True)
+            ]
+
         return {
-            "selected_correspondents": [
-                {"id": t.id, "document_count": t.document_count} for t in correspondents
-            ],
-            "selected_tags": [
-                {"id": t.id, "document_count": t.document_count} for t in tags
-            ],
-            "selected_document_types": [
-                {"id": t.id, "document_count": t.document_count} for t in document_types
-            ],
-            "selected_storage_paths": [
-                {"id": t.id, "document_count": t.document_count} for t in storage_paths
-            ],
-            "selected_custom_fields": [
-                {"id": t.id, "document_count": t.document_count} for t in custom_fields
-            ],
+            "selected_correspondents": selection(
+                Correspondent,
+                foreign_key_counts("correspondent_id"),
+            ),
+            "selected_tags": selection(
+                Tag,
+                link_table_counts(Document.tags.through, "tag_id"),
+            ),
+            "selected_document_types": selection(
+                DocumentType,
+                foreign_key_counts("document_type_id"),
+            ),
+            "selected_storage_paths": selection(
+                StoragePath,
+                foreign_key_counts("storage_path_id"),
+            ),
+            "selected_custom_fields": selection(
+                CustomField,
+                link_table_counts(CustomFieldInstance, "field_id"),
+            ),
         }
 
     @classmethod
