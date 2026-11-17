@@ -419,9 +419,50 @@ class TestSearch:
             len(backend.search_ids("monthly", user=None, search_mode=SearchMode.TITLE))
             == 0
         )
+        assert backend.search_ids(
+            "invoice",
+            user=None,
+            search_mode=SearchMode.TITLE,
+        ) == [doc.pk]
+
+    def test_title_update_replaces_stale_search_results(
+        self,
+        backend: TantivyBackend,
+    ) -> None:
+        """Updating a document title must replace stale search results."""
+
+        doc = Document.objects.create(
+            title="Quarterly Finance Report",
+            content="document lifecycle regression",
+            checksum="REG_TITLE_001",
+        )
+
+        backend.add_or_update(doc)
+
+        assert backend.search_ids(
+            "Quarterly Finance",
+            user=None,
+            search_mode=SearchMode.TITLE,
+        ) == [doc.pk]
+
+        doc.title = "Annual Compliance Report"
+        doc.save()
+
+        backend.add_or_update(doc)
+
+        assert backend.search_ids(
+            "Annual Compliance",
+            user=None,
+            search_mode=SearchMode.TITLE,
+        ) == [doc.pk]
+
         assert (
-            len(backend.search_ids("invoice", user=None, search_mode=SearchMode.TITLE))
-            == 1
+            backend.search_ids(
+                "Quarterly Finance",
+                user=None,
+                search_mode=SearchMode.TITLE,
+            )
+            == []
         )
 
     def test_text_mode_matches_partial_term_substrings(
