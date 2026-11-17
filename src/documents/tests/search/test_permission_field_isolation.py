@@ -105,6 +105,38 @@ class TestPermissionFilteringOnIndexedDocuments:
         assert backend.search_ids("invoice", user=owner) == [doc.pk]
         assert backend.search_ids("invoice", user=stranger) == []
 
+    def test_ownership_change_updates_search_visibility(
+        self,
+        backend: TantivyBackend,
+        owner: User,
+        stranger: User,
+    ) -> None:
+        """Changing document ownership must update search visibility."""
+
+        doc = Document.objects.create(
+            title="Ownership Transfer Regression",
+            content="confidential transfer marker",
+            checksum="REG_OWNER_001",
+            owner=owner,
+        )
+
+        # Verify initial search permissions
+        backend.add_or_update(doc)
+
+        assert backend.search_ids("confidential", user=owner) == [doc.pk]
+        assert backend.search_ids("confidential", user=stranger) == []
+
+        # Transfer document ownership
+        doc.owner = stranger
+        doc.save()
+
+        # Reindex updated document
+        backend.add_or_update(doc)
+
+        # Verify permissions after ownership change
+        assert backend.search_ids("confidential", user=owner) == []
+        assert backend.search_ids("confidential", user=stranger) == [doc.pk]
+
     def test_explicitly_shared_document_is_visible_to_the_viewer(
         self,
         backend: TantivyBackend,
