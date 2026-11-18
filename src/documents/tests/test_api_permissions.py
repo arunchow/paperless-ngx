@@ -515,6 +515,115 @@ class TestApiAuth(DirectoriesMixin, APITestCase):
         self.assertEqual(doc.title, "Ownered doc")
         self.assertEqual(doc.content, "sensitive")
 
+    def test_document_permission_revocation_blocks_subsequent_access(self) -> None:
+        """
+        GIVEN:
+            - A document owned by one user
+            - A second user with global document-view permission
+        WHEN:
+            - The owner grants and subsequently revokes viewing permission
+        THEN:
+            - The viewer can access the document while permission is granted
+            - Subsequent retrieval and download requests are denied
+        """
+        owner = UserFactory(username="revocation_owner", superuser=True)
+        viewer = UserFactory(username="revocation_viewer")
+
+        grant_global(viewer, "view_document")
+
+        doc = Document.objects.create(
+            title="Permission revocation regression",
+            content="confidential document",
+            checksum="revocation001",
+            mime_type="application/pdf",
+            owner=owner,
+        )
+
+        original_path = Path(doc.source_path)
+        original_path.parent.mkdir(parents=True, exist_ok=True)
+        original_path.write_bytes(b"Permission revocation test document")
+
+        document_url = f"/api/documents/{doc.pk}/"
+        download_url = f"/api/documents/{doc.pk}/download/"
+
+        # GIVEN: Viewer initially lacks object-level access.
+        self.client.force_authenticate(viewer)
+
+        response = self.client.get(document_url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        response = self.client.get(download_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        # WHEN: Owner grants viewing permission through the API.
+        self.client.force_authenticate(owner)
+
+        response = self.client.patch(
+            document_url,
+            json.dumps(
+                {
+                    "set_permissions": {
+                        "view": {
+                            "users": [viewer.id],
+                            "groups": [],
+                        },
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        doc.refresh_from_db()
+        self.assertIn("view_document", get_perms(viewer, doc))
+
+        # THEN: Viewer can retrieve and download the document.
+        self.client.force_authenticate(viewer)
+
+        response = self.client.get(document_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.get(download_url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response.close()
+
+        # WHEN: Owner revokes the viewer's permission through the API.
+        self.client.force_authenticate(owner)
+
+        response = self.client.patch(
+            document_url,
+            json.dumps(
+                {
+                    "set_permissions": {
+                        "view": {
+                            "users": [],
+                            "groups": [],
+                        },
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        doc.refresh_from_db()
+        self.assertNotIn("view_document", get_perms(viewer, doc))
+
+        # THEN: Subsequent requests must enforce the revoked permission.
+        self.client.force_authenticate(viewer)
+
+        response = self.client.get(document_url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        response = self.client.get(download_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        # The permission change must not delete the document or its file.
+        self.assertTrue(Document.objects.filter(pk=doc.pk).exists())
+        self.assertTrue(original_path.is_file())
+
     def test_document_delete_requires_object_permission(self) -> None:
         """
         GIVEN:
