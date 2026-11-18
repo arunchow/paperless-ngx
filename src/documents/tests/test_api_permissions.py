@@ -1,5 +1,6 @@
 import base64
 import json
+from pathlib import Path
 from unittest import mock
 
 from allauth.mfa.models import Authenticator
@@ -485,6 +486,14 @@ class TestApiAuth(DirectoriesMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+        # Regression protection (RISK-003, AC-7):
+        # A denied sharing-permission change must preserve existing permissions.
+        doc.refresh_from_db()
+
+        # Verify that the actual object-level permission grants remain unchanged.
+        self.assertIn("view_document", get_perms(editor, doc))
+        self.assertIn("change_document", get_perms(editor, doc))
+
         self.client.force_authenticate(editor)
         response = self.client.patch(
             f"/api/documents/{doc.pk}/",
@@ -497,6 +506,127 @@ class TestApiAuth(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Regression protection (RISK-003, AC-7):
+        # A denied ownership transfer must not modify the document.
+        doc.refresh_from_db()
+
+        self.assertEqual(doc.owner_id, owner.id)
+        self.assertEqual(doc.title, "Ownered doc")
+        self.assertEqual(doc.content, "sensitive")
+
+    def test_document_delete_requires_object_permission(self) -> None:
+        """
+        GIVEN:
+            - A document owned by another user
+            - A requester with global delete and object-level view permission
+            - No object-level delete permission
+        WHEN:
+            - The requester attempts to delete the document
+        THEN:
+            - The request is rejected
+            - The document remains unchanged
+        """
+        owner = UserFactory(username="delete_owner")
+        requester = UserFactory(username="delete_requester")
+
+        doc = Document.objects.create(
+            title="Restricted document",
+            content="confidential content",
+            checksum="delete-test-123",
+            mime_type="application/pdf",
+            owner=owner,
+        )
+
+        grant_global(requester, "view_document", "delete_document")
+        grant_object(requester, doc, "view_document")
+
+        # Create an original document file for preservation testing.
+        original_content = b"Confidential document test content"
+        original_path = Path(doc.source_path)
+
+        original_path.write_bytes(original_content)
+
+        self.client.force_authenticate(requester)
+
+        response = self.client.delete(f"/api/documents/{doc.pk}/")
+
+        # Regression protection (RISK-003, AC-4 and AC-6):
+        # Viewing permission must not authorize document deletion.
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        # Regression protection (RISK-003, AC-7):
+        # A denied deletion must preserve the document record.
+        self.assertTrue(Document.objects.filter(pk=doc.pk).exists())
+
+        doc.refresh_from_db()
+
+        # The document must not be moved to the trash.
+        self.assertIsNone(doc.deleted_at)
+
+        self.assertEqual(doc.owner_id, owner.id)
+        self.assertEqual(doc.title, "Restricted document")
+        self.assertEqual(doc.content, "confidential content")
+        # Regression protection (RISK-003, AC-7):
+        # Unauthorized deletion must not remove or modify the original file.
+        self.assertTrue(original_path.is_file())
+        self.assertEqual(original_path.read_bytes(), original_content)
+
+    def test_document_metadata_update_requires_object_permission(self) -> None:
+        """
+        GIVEN:
+            - A document owned by another user
+            - A requester with global view/change permissions
+            - Object-level view permission but no change permission
+        WHEN:
+            - The requester attempts to update document metadata
+        THEN:
+            - The request is rejected
+            - The document metadata remains unchanged
+        """
+        owner = UserFactory(username="metadata_owner")
+        requester = UserFactory(username="metadata_requester")
+
+        doc = Document.objects.create(
+            title="Restricted document",
+            content="confidential content",
+            checksum="metadata-test-123",
+            mime_type="application/pdf",
+            owner=owner,
+        )
+
+        # Global permissions permit the requester to access the API.
+        grant_global(requester, "view_document", "change_document")
+
+        # Object-level permission allows viewing, but not modification.
+        grant_object(requester, doc, "view_document")
+
+        self.client.force_authenticate(requester)
+
+        response = self.client.patch(
+            f"/api/documents/{doc.pk}/",
+            {"title": "Unauthorized title change"},
+            format="json",
+        )
+
+        # Regression protection (RISK-003, AC-3 and AC-6):
+        # Global change permission must not bypass object-level authorization.
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        # Regression protection (RISK-003, AC-7):
+        # A denied metadata update must leave the document unchanged.
+        doc.refresh_from_db()
+
+        self.assertEqual(doc.owner_id, owner.id)
+        self.assertEqual(doc.title, "Restricted document")
+        self.assertEqual(doc.content, "confidential content")
+        self.assertIsNone(doc.deleted_at)
 
     def test_dynamic_permissions_fields(self) -> None:
         user1 = UserFactory(username="user1")
