@@ -275,41 +275,149 @@ class TestMakeThumbnailFromPdf:
             assert im.width == expected_width
 
     @classmethod
-    def _write_pdf_without_xref(cls, path: Path) -> Path:
+    def _write_pdf_with_invalid_startxref(cls, path: Path) -> Path:
         """
-        Cuts off the xref and trailer, which pdftoppm cannot recover from but qpdf can.
+        Create a PDF with an invalid cross-reference pointer.
+
+        qpdf can recover the document by reconstructing its
+        cross-reference information.
         """
         cls._write_blank_pdf(path)
+
         data = path.read_bytes()
-        path.write_bytes(data[: data.rindex(b"\nxref")])
+        startxref_position = data.rindex(b"startxref\n")
+        offset_start = startxref_position + len(b"startxref\n")
+        offset_end = data.index(b"\n", offset_start)
+
+        data = data[:offset_start] + b"999999" + data[offset_end:]
+
+        path.write_bytes(data)
         return path
 
     def test_qpdf_repair_produces_real_thumbnail(
         self,
+        mocker: MockerFixture,
         tmp_path: Path,
         work_dir: Path,
     ) -> None:
         """
         GIVEN:
-            - A PDF with its xref table and trailer cut off
+            - A PDF with an invalid cross-reference pointer
+            - An initial rasterization failure
         WHEN:
-            - A thumbnail is made from it
+            - Thumbnail generation retries through qpdf
         THEN:
-            - The thumbnail is rendered from a qpdf repaired copy
-            - The original file is unchanged
+            - qpdf repairs the damaged PDF
+            - A real WebP thumbnail is generated
+            - The original PDF remains unchanged
         """
-        pdf_path = self._write_pdf_without_xref(tmp_path / "broken.pdf")
+        pdf_path = self._write_pdf_with_invalid_startxref(
+            tmp_path / "broken.pdf",
+        )
         original_bytes = pdf_path.read_bytes()
 
-        with pytest.raises(ParseError):
-            rasterize_pdf_page_to_png(pdf_path, work_dir / "probe.png", dpi=50)
+        original_rasterize = rasterize_pdf_page_to_png
+        attempts = 0
+
+        def rasterize_with_initial_failure(
+            in_path: Path,
+            out_path: Path,
+            *,
+            dpi: float,
+            logging_group: object = None,
+        ) -> None:
+            nonlocal attempts
+            attempts += 1
+
+            if attempts == 1:
+                raise ParseError("Simulated initial rasterization failure")
+
+            original_rasterize(
+                in_path,
+                out_path,
+                dpi=dpi,
+                logging_group=logging_group,
+            )
+
+        mocker.patch(
+            "documents.parsers.rasterize_pdf_page_to_png",
+            side_effect=rasterize_with_initial_failure,
+        )
 
         thumb = make_thumbnail_from_pdf(pdf_path, work_dir)
 
+        assert attempts == 2
         assert thumb == work_dir / "convert_qpdf.webp"
+
         with Image.open(thumb) as im:
             assert im.format == "WEBP"
             assert im.width == 500
+
+        repaired_pdf = work_dir / "repaired.pdf"
+        assert repaired_pdf.exists()
+        assert repaired_pdf.read_bytes() != original_bytes
+
+        with pikepdf.open(repaired_pdf) as pdf:
+            assert len(pdf.pages) == 1
+
+        assert pdf_path.read_bytes() == original_bytes
+
+    def test_qpdf_fallback_renders_thumbnail_after_initial_failure(
+        self,
+        mocker: MockerFixture,
+        tmp_path: Path,
+        work_dir: Path,
+    ) -> None:
+        """
+        GIVEN:
+            - A valid PDF
+            - An initial rasterization failure
+        WHEN:
+            - Thumbnail generation retries through qpdf
+        THEN:
+            - A real thumbnail is generated from the processed copy
+            - The original PDF remains unchanged
+        """
+        pdf_path = self._write_blank_pdf(tmp_path / "in.pdf")
+        original_bytes = pdf_path.read_bytes()
+
+        original_rasterize = rasterize_pdf_page_to_png
+        attempts = 0
+
+        def rasterize_with_initial_failure(
+            in_path: Path,
+            out_path: Path,
+            *,
+            dpi: float,
+            logging_group: object = None,
+        ) -> None:
+            nonlocal attempts
+            attempts += 1
+
+            if attempts == 1:
+                raise ParseError("Simulated initial rasterization failure")
+
+            original_rasterize(
+                in_path,
+                out_path,
+                dpi=dpi,
+                logging_group=logging_group,
+            )
+
+        mocker.patch(
+            "documents.parsers.rasterize_pdf_page_to_png",
+            side_effect=rasterize_with_initial_failure,
+        )
+
+        thumb = make_thumbnail_from_pdf(pdf_path, work_dir)
+
+        assert attempts == 2
+        assert thumb == work_dir / "convert_qpdf.webp"
+
+        with Image.open(thumb) as im:
+            assert im.format == "WEBP"
+            assert im.width == 500
+
         assert pdf_path.read_bytes() == original_bytes
 
     @pytest.mark.parametrize(
