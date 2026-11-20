@@ -319,14 +319,25 @@ class TestMakeThumbnailFromPdf:
         original_rasterize = rasterize_pdf_page_to_png
         attempts = 0
 
-        def rasterize_with_initial_failure(*args, **kwargs):
+        def rasterize_with_initial_failure(
+            in_path: Path,
+            out_path: Path,
+            *,
+            dpi: float,
+            logging_group: object = None,
+        ) -> None:
             nonlocal attempts
             attempts += 1
 
             if attempts == 1:
                 raise ParseError("Simulated initial rasterization failure")
 
-            return original_rasterize(*args, **kwargs)
+            original_rasterize(
+                in_path,
+                out_path,
+                dpi=dpi,
+                logging_group=logging_group,
+            )
 
         mocker.patch(
             "documents.parsers.rasterize_pdf_page_to_png",
@@ -373,14 +384,25 @@ class TestMakeThumbnailFromPdf:
         original_rasterize = rasterize_pdf_page_to_png
         attempts = 0
 
-        def rasterize_with_initial_failure(*args, **kwargs):
+        def rasterize_with_initial_failure(
+            in_path: Path,
+            out_path: Path,
+            *,
+            dpi: float,
+            logging_group: object = None,
+        ) -> None:
             nonlocal attempts
             attempts += 1
 
             if attempts == 1:
                 raise ParseError("Simulated initial rasterization failure")
 
-            return original_rasterize(*args, **kwargs)
+            original_rasterize(
+                in_path,
+                out_path,
+                dpi=dpi,
+                logging_group=logging_group,
+            )
 
         mocker.patch(
             "documents.parsers.rasterize_pdf_page_to_png",
